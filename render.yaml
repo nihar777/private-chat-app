@@ -1,0 +1,15 @@
+# Render Blueprint — combined single web service (free tier).
+# Free instances sleep after 15 min idle; first hit after sleep cold-starts (~30s).
+services:
+  - type: web
+    name: private-chat
+    runtime: node
+    plan: free
+    # build client + install server, then start serves both from one origin
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # PORT is provided by Render automatically; server reads process.env.PORT
