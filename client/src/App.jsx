@@ -1,18 +1,45 @@
 import { useEffect, useRef, useState } from "react";
 import { socket } from "./socket";
 
+// Stable per-browser id so a reconnecting user reclaims the SAME room slot.
+const CLIENT_ID = getClientId();
+function getClientId() {
+  try {
+    let id = localStorage.getItem("pc_clientId");
+    if (!id) {
+      id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem("pc_clientId", id);
+    }
+    return id;
+  } catch {
+    return Math.random().toString(36).slice(2);
+  }
+}
+
+// Session (roomId + messages) lives in sessionStorage so it survives a tab
+// reload/evict, but is cleared on real tab close or explicit Leave.
+function loadSession() {
+  try {
+    return JSON.parse(sessionStorage.getItem("pc_session") || "null");
+  } catch {
+    return null;
+  }
+}
+
 // Screens: "lobby" -> "chat"
 export default function App() {
-  const [screen, setScreen] = useState("lobby");
-  const [roomId, setRoomId] = useState("");
+  const saved = loadSession();
+  const [screen, setScreen] = useState(saved?.roomId ? "chat" : "lobby");
+  const [roomId, setRoomId] = useState(saved?.roomId || "");
   const [joinCode, setJoinCode] = useState("");
   const [error, setError] = useState("");
   const [members, setMembers] = useState(1);
   const [peerLeft, setPeerLeft] = useState(false);
+  const [peerAway, setPeerAway] = useState(false);
   const [peerTyping, setPeerTyping] = useState(false);
 
-  // messages live ONLY in component state. Refresh/close => gone.
-  const [messages, setMessages] = useState([]);
+  // messages survive reload via sessionStorage; gone on tab close / Leave.
+  const [messages, setMessages] = useState(saved?.messages || []);
   const [draft, setDraft] = useState("");
 
   const bottomRef = useRef(null);
@@ -33,17 +60,29 @@ export default function App() {
     const onPeerLeft = () => {
       setMembers(1);
       setPeerLeft(true);
+      setPeerAway(false);
       setPeerTyping(false);
       add({ system: true, text: "Stranger left. Room will vanish when you leave." });
     };
     const onRoomStatus = ({ members }) => setMembers(members);
     const onPeerTyping = (t) => setPeerTyping(t);
+    const onPeerAway = () => {
+      setPeerAway(true);
+      setPeerTyping(false);
+      add({ system: true, text: "Stranger went away — may return within 5 min." });
+    };
+    const onPeerBack = () => {
+      setPeerAway(false);
+      add({ system: true, text: "Stranger is back." });
+    };
 
     socket.on("message", onMessage);
     socket.on("peer-joined", onPeerJoined);
     socket.on("peer-left", onPeerLeft);
     socket.on("room-status", onRoomStatus);
     socket.on("peer-typing", onPeerTyping);
+    socket.on("peer-away", onPeerAway);
+    socket.on("peer-back", onPeerBack);
 
     return () => {
       socket.off("message", onMessage);
@@ -51,15 +90,60 @@ export default function App() {
       socket.off("peer-left", onPeerLeft);
       socket.off("room-status", onRoomStatus);
       socket.off("peer-typing", onPeerTyping);
+      socket.off("peer-away", onPeerAway);
+      socket.off("peer-back", onPeerBack);
     };
   }, []);
 
-  // leave room when tab closes
+  // Keep a live ref of the current room for the connect handler's closure.
+  const roomIdRef = useRef(roomId);
   useEffect(() => {
-    const bye = () => socket.emit("leave-room");
-    window.addEventListener("beforeunload", bye);
-    return () => window.removeEventListener("beforeunload", bye);
+    roomIdRef.current = roomId;
+  }, [roomId]);
+
+  // On (re)connect — including the first load after a tab reload/evict —
+  // rejoin the saved room. Server reclaims our held slot if grace hasn't
+  // expired; otherwise it's gone and we fall back to the lobby.
+  useEffect(() => {
+    const onConnect = () => {
+      const rid = roomIdRef.current;
+      if (!rid) return;
+      socket.emit("join-room", { roomId: rid, clientId: CLIENT_ID }, (res) => {
+        if (!res?.ok) {
+          sessionStorage.removeItem("pc_session");
+          setScreen("lobby");
+          setRoomId("");
+          setMessages([]);
+          setMembers(1);
+          setPeerLeft(false);
+          setPeerAway(false);
+          setError(res?.error || "Room closed.");
+        } else {
+          setMembers(res.members);
+        }
+      });
+    };
+    socket.on("connect", onConnect);
+    if (socket.connected) onConnect(); // already connected on mount
+    return () => socket.off("connect", onConnect);
   }, []);
+
+  // Persist the session so a reload lands back in the chat, not the lobby.
+  useEffect(() => {
+    try {
+      if (screen === "chat" && roomId) {
+        sessionStorage.setItem("pc_session", JSON.stringify({ roomId, messages }));
+      }
+    } catch {
+      // sessionStorage full (large images) — chat still works, just won't
+      // fully restore on reload. Non-fatal.
+    }
+  }, [screen, roomId, messages]);
+
+  // NOTE: deliberately NO beforeunload leave-room emit. A reload can't be
+  // told apart from a close, and emitting leave would destroy the slot
+  // instantly — killing the 5-min grace. The socket "disconnect" on the
+  // server handles both cases with the grace hold instead.
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -72,7 +156,7 @@ export default function App() {
     setError("");
     socket.emit("create-room", (res) => {
       if (!res?.ok) return setError(res?.error || "Failed to create room.");
-      socket.emit("join-room", { roomId: res.roomId }, (j) => {
+      socket.emit("join-room", { roomId: res.roomId, clientId: CLIENT_ID }, (j) => {
         if (!j?.ok) return setError(j?.error || "Failed to join room.");
         setRoomId(res.roomId);
         setMembers(j.members);
@@ -87,12 +171,13 @@ export default function App() {
     setError("");
     const code = joinCode.trim().toUpperCase();
     if (!code) return setError("Enter a room code.");
-    socket.emit("join-room", { roomId: code }, (res) => {
+    socket.emit("join-room", { roomId: code, clientId: CLIENT_ID }, (res) => {
       if (!res?.ok) return setError(res?.error || "Failed to join.");
       setRoomId(code);
       setMembers(res.members);
       setMessages([]);
       setPeerLeft(false);
+      setPeerAway(false);
       setScreen("chat");
     });
   }
@@ -134,11 +219,13 @@ export default function App() {
 
   function leaveRoom() {
     socket.emit("leave-room");
+    sessionStorage.removeItem("pc_session");
     setScreen("lobby");
     setRoomId("");
     setJoinCode("");
     setMessages([]);
     setPeerLeft(false);
+    setPeerAway(false);
     setMembers(1);
   }
 
@@ -183,7 +270,11 @@ export default function App() {
             <span className="dot" data-on={members >= 2} />
             Room <code>{roomId}</code>
             <span className="who">
-              {members >= 2 ? "Stranger connected" : "Waiting for stranger…"}
+              {members >= 2
+                ? peerAway
+                  ? "Stranger away…"
+                  : "Stranger connected"
+                : "Waiting for stranger…"}
             </span>
           </div>
           <button className="ghost" onClick={leaveRoom}>

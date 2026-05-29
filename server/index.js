@@ -26,13 +26,17 @@ const io = new Server(server, {
 });
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // server-side guard
+const GRACE_MS = 5 * 60 * 1000; // keep a room alive 5 min after a member drops
 
 /**
  * Ephemeral, in-memory room store. Nothing touches disk.
- * rooms: Map<roomId, { members: Set<socketId>, createdAt: number }>
+ * rooms: Map<roomId, { members: Map<clientId, Member>, createdAt: number }>
+ *   Member = { socketId, away: boolean, timer: Timeout|null }
+ * Members are keyed by a stable browser clientId (NOT socketId) so a user
+ * who drops (tab evicted, network blip) can reconnect into the SAME slot
+ * within GRACE_MS. The room is only destroyed once a slot's grace expires
+ * with nobody reclaiming it, or on an explicit Leave.
  * Messages are NEVER stored server-side — they are relayed only.
- * When a room's member count hits 0, the room is deleted and its
- * existence (and any chance of rejoining) disappears entirely.
  */
 const rooms = new Map();
 const MAX_MEMBERS = 2;
@@ -41,32 +45,50 @@ const genRoomId = () => crypto.randomBytes(3).toString("hex").toUpperCase(); // 
 
 io.on("connection", (socket) => {
   let joinedRoom = null;
+  let clientId = null;
 
   // ---- Create a room ----
   socket.on("create-room", (cb) => {
     let roomId = genRoomId();
     while (rooms.has(roomId)) roomId = genRoomId();
-    rooms.set(roomId, { members: new Set(), createdAt: Date.now() });
+    rooms.set(roomId, { members: new Map(), createdAt: Date.now() });
     cb?.({ ok: true, roomId });
   });
 
-  // ---- Join a room ----
-  socket.on("join-room", ({ roomId } = {}, cb) => {
+  // ---- Join (or rejoin) a room ----
+  socket.on("join-room", ({ roomId, clientId: cid } = {}, cb) => {
     roomId = (roomId || "").trim().toUpperCase();
     const room = rooms.get(roomId);
-
     if (!room) return cb?.({ ok: false, error: "Room not found or already closed." });
+
+    cid = (cid || socket.id).toString();
+    const existing = room.members.get(cid);
+
+    if (existing) {
+      // Returning member -> reclaim the held slot, cancel its grace timer.
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = null;
+      existing.socketId = socket.id;
+      existing.away = false;
+      socket.join(roomId);
+      joinedRoom = roomId;
+      clientId = cid;
+      cb?.({ ok: true, roomId, members: room.members.size });
+      socket.to(roomId).emit("peer-back");
+      socket.emit("room-status", { members: room.members.size });
+      return;
+    }
+
     if (room.members.size >= MAX_MEMBERS)
       return cb?.({ ok: false, error: "Room is full (2 users max)." });
 
-    room.members.add(socket.id);
+    room.members.set(cid, { socketId: socket.id, away: false, timer: null });
     socket.join(roomId);
     joinedRoom = roomId;
+    clientId = cid;
 
     cb?.({ ok: true, roomId, members: room.members.size });
-    // Tell the other peer someone joined.
     socket.to(roomId).emit("peer-joined", { members: room.members.size });
-    // Tell the joiner the current count.
     socket.emit("room-status", { members: room.members.size });
   });
 
@@ -101,23 +123,42 @@ io.on("connection", (socket) => {
     socket.to(joinedRoom).emit("peer-typing", !!isTyping);
   });
 
-  // ---- Explicit leave ----
-  socket.on("leave-room", () => leave());
+  // ---- Explicit Leave button -> destroy slot immediately, no grace. ----
+  socket.on("leave-room", () => removeNow());
 
-  // ---- Disconnect (tab close, network drop) ----
-  socket.on("disconnect", () => leave());
+  // ---- Disconnect (tab close/evict, network drop) -> hold slot GRACE_MS. ----
+  socket.on("disconnect", () => holdOrRemove());
 
-  function leave() {
-    if (!joinedRoom) return;
-    const room = rooms.get(joinedRoom);
-    if (room) {
-      room.members.delete(socket.id);
+  function removeNow() {
+    const room = joinedRoom && rooms.get(joinedRoom);
+    if (room && clientId) {
+      const m = room.members.get(clientId);
+      if (m?.timer) clearTimeout(m.timer);
+      room.members.delete(clientId);
       socket.to(joinedRoom).emit("peer-left");
-      // Room empty -> destroy it. Chat disappears.
       if (room.members.size === 0) rooms.delete(joinedRoom);
     }
-    socket.leave(joinedRoom);
+    if (joinedRoom) socket.leave(joinedRoom);
     joinedRoom = null;
+  }
+
+  function holdOrRemove() {
+    const rid = joinedRoom;
+    const room = rid && rooms.get(rid);
+    if (!room || !clientId) return;
+    const m = room.members.get(clientId);
+    if (!m || m.socketId !== socket.id) return; // a newer socket already reclaimed it
+    m.away = true;
+    socket.to(rid).emit("peer-away");
+    m.timer = setTimeout(() => {
+      const r = rooms.get(rid);
+      if (!r) return;
+      const cur = r.members.get(clientId);
+      if (!cur || !cur.away) return; // came back during grace
+      r.members.delete(clientId);
+      io.to(rid).emit("peer-left");
+      if (r.members.size === 0) rooms.delete(rid);
+    }, GRACE_MS);
   }
 });
 
